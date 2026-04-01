@@ -973,96 +973,97 @@ def main(input_tif):
         print_header("森林非监督分类系统")
 
         # 显示当前使用的算法
-    algorithm = CLASSIFICATION_CONFIG.get('algorithm', 'slic')
-    if algorithm == 'slic':
-        print_info(f"分类算法: SLIC超像素分割")
-    elif algorithm == 'kmeans':
-        print_info(f"分类算法: K-means聚类")
+        algorithm = CLASSIFICATION_CONFIG.get('algorithm', 'slic')
+        if algorithm == 'slic':
+            print_info(f"分类算法: SLIC超像素分割")
+        elif algorithm == 'kmeans':
+            print_info(f"分类算法: K-means聚类")
 
-    print(f"\n{Fore.YELLOW}处理参数:{Style.RESET_ALL}")
-    print(f"  聚类数量: {CLASSIFICATION_CONFIG['n_clusters']}")
-    print(f"  森林NDVI阈值: {NDVI_THRESHOLDS['forest_min']}")
-    print(f"  乔木林NDVI阈值: {NDVI_THRESHOLDS['arbor_forest_min']}")
+        print(f"\n{Fore.YELLOW}处理参数:{Style.RESET_ALL}")
+        print(f"  聚类数量: {CLASSIFICATION_CONFIG['n_clusters']}")
+        print(f"  森林NDVI阈值: {NDVI_THRESHOLDS['forest_min']}")
+        print(f"  乔木林NDVI阈值: {NDVI_THRESHOLDS['arbor_forest_min']}")
 
-    # 显示并行处理配置
-    print(f"\n{Fore.YELLOW}并行处理配置:{Style.RESET_ALL}")
-    print(f"  K-means并行进程数: {PARALLEL_CONFIG['kmeans_n_jobs']}")
-    print(f"  SLIC并行进程数: {PARALLEL_CONFIG['slic_n_jobs']}")
-    print(f"  超像素特征提取并行进程数: {PARALLEL_CONFIG['feature_extraction_n_jobs']}")
-    print(f"  后处理并行进程数: {PARALLEL_CONFIG['post_process_n_jobs']}")
-    print(f"  最大内存使用限制: {PARALLEL_CONFIG['max_memory_mb']:.2f} MB (30%)")
-    print(f"  分块处理: {'启用' if PARALLEL_CONFIG['enable_chunking'] else '禁用'}")
+        # 显示并行处理配置
+        print(f"\n{Fore.YELLOW}并行处理配置:{Style.RESET_ALL}")
+        print(f"  K-means并行进程数: {PARALLEL_CONFIG['kmeans_n_jobs']}")
+        print(f"  SLIC并行进程数: {PARALLEL_CONFIG['slic_n_jobs']}")
+        print(f"  超像素特征提取并行进程数: {PARALLEL_CONFIG['feature_extraction_n_jobs']}")
+        print(f"  后处理并行进程数: {PARALLEL_CONFIG['post_process_n_jobs']}")
+        print(f"  最大内存使用限制: {PARALLEL_CONFIG['max_memory_mb']:.2f} MB (30%)")
+        print(f"  分块处理: {'启用' if PARALLEL_CONFIG['enable_chunking'] else '禁用'}")
 
-    # 创建输出目录
-    output_dir = OUTPUT_CONFIG['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
-    print_info(f"输出目录: {output_dir}")
+        # 创建输出目录
+        output_dir = OUTPUT_CONFIG['output_dir']
+        os.makedirs(output_dir, exist_ok=True)
+        print_info(f"输出目录: {output_dir}")
 
-    # 初始化分类器
-    classifier = ForestClassifier()
+        # 初始化分类器
+        classifier = ForestClassifier()
 
-    # 步骤1：读取TIF文件
-    print_step(1, 7, "读取遥感影像")
-    if not classifier.read_tif(input_tif):
-        print_error("文件读取失败，程序终止")
-        return
+        # 步骤1：读取TIF文件
+        print_step(1, 7, "读取遥感影像")
+        if not classifier.read_tif(input_tif):
+            print_error("文件读取失败，程序终止")
+            return
 
-    # 步骤2：计算NDVI
-    print_step(2, 7, "计算NDVI植被指数")
-    classifier.calculate_ndvi()
+        # 步骤2：计算NDVI
+        print_step(2, 7, "计算NDVI植被指数")
+        classifier.calculate_ndvi()
 
-    # 步骤3：执行分类
-    print_step(3, 7, "执行非监督分类")
-    if not classifier.classify():
-        print_error("分类失败，程序终止")
-        return
+        # 步骤3：执行分类
+        print_step(3, 7, "执行非监督分类")
+        if not classifier.classify():
+            print_error("分类失败，程序终止")
+            return
 
-    # 步骤4：后处理
-    print_step(4, 7, "后处理（过滤小斑块）")
-    classifier.post_process()
+        # 步骤4：后处理
+        print_step(4, 7, "后处理（过滤小斑块）")
+        classifier.post_process()
 
-    # 步骤5：识别森林类别
-    print_step(5, 7, "识别森林类别")
-    class_info = classifier.identify_forest_classes()
+        # 步骤5：识别森林类别
+        print_step(5, 7, "识别森林类别")
+        class_info = classifier.identify_forest_classes()
 
-    # 步骤6：计算统计结果
-    print_step(6, 7, "计算森林覆盖率")
-    statistics = classifier.calculate_statistics(class_info)
+        # 步骤6：计算统计结果
+        print_step(6, 7, "计算森林覆盖率")
+        statistics = classifier.calculate_statistics(class_info)
 
-    # 步骤7：保存结果
-    print_step(7, 7, "保存结果文件")
+        # 步骤7：保存结果
+        print_step(7, 7, "保存结果文件")
 
-    # 保存分类结果
-    classified_output = os.path.join(output_dir, OUTPUT_CONFIG['classified_file'])
-    classifier.save_classified_tif(classified_output)
+        # 保存分类结果
+        classified_output = os.path.join(output_dir, OUTPUT_CONFIG['classified_file'])
+        classifier.save_classified_tif(classified_output)
 
-    # 保存NDVI
-    ndvi_output = os.path.join(output_dir, OUTPUT_CONFIG['ndvi_file'])
-    classifier.save_ndvi_tif(ndvi_output)
+        # 保存NDVI
+        ndvi_output = os.path.join(output_dir, OUTPUT_CONFIG['ndvi_file'])
+        classifier.save_ndvi_tif(ndvi_output)
 
-    # 保存统计结果
-    stats_output = os.path.join(output_dir, OUTPUT_CONFIG['statistics_file'])
-    with open(stats_output, 'w', encoding='utf-8') as f:
-        json.dump(statistics, f, indent=2, ensure_ascii=False)
-    print_success(f"统计结果已保存: {stats_output}")
+        # 保存统计结果
+        stats_output = os.path.join(output_dir, OUTPUT_CONFIG['statistics_file'])
+        with open(stats_output, 'w', encoding='utf-8') as f:
+            json.dump(statistics, f, indent=2, ensure_ascii=False)
+        print_success(f"统计结果已保存: {stats_output}")
 
-    # 生成CSV报告
-    report_output = os.path.join(output_dir, OUTPUT_CONFIG['report_file'])
-    df = pd.DataFrame([statistics])
-    df.to_csv(report_output, index=False, encoding='utf-8-sig')
-    print_success(f"CSV报告已保存: {report_output}")
+        # 生成CSV报告
+        report_output = os.path.join(output_dir, OUTPUT_CONFIG['report_file'])
+        df = pd.DataFrame([statistics])
+        df.to_csv(report_output, index=False, encoding='utf-8-sig')
+        print_success(f"CSV报告已保存: {report_output}")
 
-    # 可视化
-    if OUTPUT_CONFIG['visualization']:
-        print_info("正在生成可视化结果...")
-        vis_output = os.path.join(output_dir, 'classification_results.png')
-        classifier.visualize_results(vis_output, class_info)
+        # 可视化
+        if OUTPUT_CONFIG['visualization']:
+            print_info("正在生成可视化结果...")
+            vis_output = os.path.join(output_dir, 'classification_results.png')
+            classifier.visualize_results(vis_output, class_info)
 
-    # 完成提示
-    print(f"\n{Fore.GREEN}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{Style.BRIGHT}✓ 处理完成！{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}所有结果已保存到: {Fore.CYAN}{output_dir}{Style.RESET_ALL}\n")
+
+        # 完成提示
+        print(f"\n{Fore.GREEN}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{Style.BRIGHT}✓ 处理完成！{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}所有结果已保存到: {Fore.CYAN}{output_dir}{Style.RESET_ALL}\n")
 
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}⚠ 程序被用户中断{Style.RESET_ALL}")
