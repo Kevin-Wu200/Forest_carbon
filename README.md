@@ -49,7 +49,7 @@ python forest_classifier.py --help
 - `-a, --algorithm`: 分类算法，可选 slic/kmeans (默认: slic)
 - `-k, --n-clusters`: 聚类数量 (默认: 7)
 - `--random-state`: 随机种子 (默认: 42)
-- `--n-init`: K-means重复次数 (默认: 10)
+- `--n-init`: 聚类重复次数（用于K-means算法和SLIC超像素聚类） (默认: 10)
 - `--max-iter`: 最大迭代次数 (默认: 300)
 
 #### SLIC超像素参数（仅在使用 -a slic 时有效）
@@ -91,7 +91,7 @@ python forest_classifier.py --help
 **分类参数：**
 - `n_clusters`: 聚类数量（默认7）
 - `random_state`: 随机种子
-- `n_init`: K-means重复次数
+- `n_init`: 聚类重复次数（用于K-means算法和SLIC超像素聚类）
 - `max_iter`: 最大迭代次数
 
 **NDVI阈值：**

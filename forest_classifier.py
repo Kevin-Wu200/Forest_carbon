@@ -1118,7 +1118,7 @@ def interactive_input():
     else:
         args.random_state = int(args.random_state)
 
-    args.n_init = input(f"K-means重复次数 [{CLASSIFICATION_CONFIG['n_init']}]: ").strip()
+    args.n_init = input(f"聚类重复次数（用于K-means算法和SLIC超像素聚类）[{CLASSIFICATION_CONFIG['n_init']}]: ").strip()
     if not args.n_init:
         args.n_init = CLASSIFICATION_CONFIG['n_init']
     else:
