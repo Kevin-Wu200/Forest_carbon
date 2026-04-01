@@ -69,7 +69,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 from config import (CLASSIFICATION_CONFIG, SLIC_CONFIG, NDVI_THRESHOLDS,
                     BAND_INDICES, POST_PROCESSING, OUTPUT_CONFIG, AREA_CONFIG,
-                    PARALLEL_CONFIG, get_memory_info)
+                    PARALLEL_CONFIG, get_memory_info, TREE_SPECIES_CONFIG,
+                    BLOCK_CONFIG, VECTOR_OUTPUT_CONFIG, CARBON_CALCULATION_CONFIG,
+                    get_cpu_count)
 
 
 # ========== 彩色输出辅助函数 ==========
@@ -697,6 +699,789 @@ class ForestClassifier:
             'class_stats': class_stats
         }
 
+    def extract_rgb_features(self):
+        """
+        提取RGB颜色特征
+
+        用于基于432假彩色合成的树种判断
+
+        Returns:
+        --------
+        dict
+            每个类别的RGB特征字典
+        """
+        print_info("正在提取RGB颜色特征...")
+
+        # 获取RGB合成波段索引
+        rgb_config = TREE_SPECIES_CONFIG['rgb_composite']
+        red_band_idx = rgb_config['red_band']
+        green_band_idx = rgb_config['green_band']
+        blue_band_idx = rgb_config['blue_band']
+
+        # 检查波段是否有效
+        if red_band_idx >= self.data.shape[0] or \
+           green_band_idx >= self.data.shape[0] or \
+           blue_band_idx >= self.data.shape[0]:
+            print_error(f"RGB波段索引超出范围，数据只有{self.data.shape[0]}个波段")
+            return None
+
+        # 提取RGB波段
+        red_band = self.data[red_band_idx]
+        green_band = self.data[green_band_idx]
+        blue_band = self.data[blue_band_idx]
+
+        # 计算每个类别的RGB特征
+        rgb_features = {}
+
+        for class_id in range(self.n_classes):
+            mask = (self.labels == class_id)
+            if not np.any(mask):
+                continue
+
+            # 提取该类别的RGB值
+            class_red = red_band[mask]
+            class_green = green_band[mask]
+            class_blue = blue_band[mask]
+
+            # 计算RGB特征
+            mean_red = np.mean(class_red)
+            mean_green = np.mean(class_green)
+            mean_blue = np.mean(class_blue)
+
+            # 计算亮度（简单平均）
+            brightness = (mean_red + mean_green + mean_blue) / 3.0
+
+            # 计算饱和度（max - min）
+            saturation = max(mean_red, mean_green, mean_blue) - min(mean_red, mean_green, mean_blue)
+
+            # 计算红色占比
+            total = mean_red + mean_green + mean_blue
+            red_ratio = mean_red / total if total > 0 else 0
+
+            # 计算红色主导性（R相对于G+B的倍数）
+            gb_sum = mean_green + mean_blue
+            red_dominance = mean_red / gb_sum if gb_sum > 0 else 1.0
+
+            rgb_features[class_id] = {
+                'mean_red': mean_red,
+                'mean_green': mean_green,
+                'mean_blue': mean_blue,
+                'brightness': brightness,
+                'saturation': saturation,
+                'red_ratio': red_ratio,
+                'red_dominance': red_dominance,
+                'pixel_count': np.sum(mask)
+            }
+
+        print_success(f"RGB特征提取完成，共 {len(rgb_features)} 个类别")
+
+        return rgb_features
+
+    def map_tree_species(self):
+        """
+        将聚类类别映射为树种类别
+
+        支持三种分类模式：
+        - rgb: 仅基于RGB颜色特征判断（432假彩色合成）
+        - ndvi: 仅基于NDVI特征判断
+        - combined: 结合RGB和NDVI特征判断
+
+        Returns:
+        --------
+        dict
+            包含树种映射和统计信息的字典
+        """
+        if not TREE_SPECIES_CONFIG['enable']:
+            print_warning("树种分类功能已禁用")
+            return None
+
+        print_info("正在进行树种分类...")
+
+        # 初始化树种标签矩阵
+        species_labels = np.zeros_like(self.labels, dtype=np.int32)
+        species_labels[:] = -1  # -1 表示未分类
+
+        # 获取分类模式
+        classification_mode = TREE_SPECIES_CONFIG['classification_mode']
+        print_info(f"分类模式: {classification_mode}")
+
+        # 提取RGB特征（如果需要）
+        rgb_features = None
+        if classification_mode in ['rgb', 'combined']:
+            rgb_features = self.extract_rgb_features()
+            if rgb_features is None:
+                print_error("RGB特征提取失败")
+                return None
+
+        # 提取NDVI特征（如果需要）
+        ndvi_features = None
+        if classification_mode in ['ndvi', 'combined']:
+            # 计算每个类别的NDVI统计
+            ndvi_features = {}
+            for class_id in range(self.n_classes):
+                mask = (self.labels == class_id)
+                if np.any(mask):
+                    class_ndvi = self.ndvi[mask]
+                    ndvi_features[class_id] = {
+                        'ndvi_mean': np.mean(class_ndvi),
+                        'ndvi_std': np.std(class_ndvi),
+                        'pixel_count': np.sum(mask)
+                    }
+
+        # 根据配置选择分类方式
+        if TREE_SPECIES_CONFIG['auto_classification']:
+            # 自动分类
+            species_mapping = {}
+            species_code = 0
+            species_rules = TREE_SPECIES_CONFIG['species_rules']
+
+            # 为每个聚类类别匹配树种
+            for class_id in range(self.n_classes):
+                if class_id not in rgb_features and classification_mode != 'ndvi':
+                    continue
+
+                if classification_mode == 'rgb':
+                    # 仅使用RGB特征
+                    rgb_stats = rgb_features[class_id]
+                    matched_species, match_score = self.match_by_rgb(rgb_stats, species_rules)
+                    match_info = f"R={rgb_stats['mean_red']:.0f}, G={rgb_stats['mean_green']:.0f}, B={rgb_stats['mean_blue']:.0f}"
+
+                elif classification_mode == 'ndvi':
+                    # 仅使用NDVI特征
+                    ndvi_stats = ndvi_features[class_id]
+                    matched_species, match_score = self.match_by_ndvi(ndvi_stats, species_rules)
+                    match_info = f"NDVI={ndvi_stats['ndvi_mean']:.3f}"
+
+                else:  # combined
+                    # 结合RGB和NDVI特征
+                    rgb_stats = rgb_features[class_id]
+                    ndvi_stats = ndvi_features[class_id]
+                    matched_species, match_score = self.match_by_combined(rgb_stats, ndvi_stats, species_rules)
+                    match_info = f"NDVI={ndvi_stats['ndvi_mean']:.3f}, RGB=(R={rgb_stats['mean_red']:.0f}, G={rgb_stats['mean_green']:.0f}, B={rgb_stats['mean_blue']:.0f})"
+
+                if matched_species:
+                    if matched_species not in species_mapping:
+                        species_mapping[matched_species] = species_code
+                        species_code += 1
+
+                    # 将该类别的像素映射到对应的树种
+                    species_labels[self.labels == class_id] = species_mapping[matched_species]
+
+                    print_info(f"类别 {class_id} → {species_rules[matched_species]['name']} "
+                             f"({match_info}, 匹配度={match_score:.2f})")
+                else:
+                    # 如果没有匹配的树种，标记为未分类
+                    if classification_mode == 'rgb':
+                        rgb_stats = rgb_features[class_id]
+                        print_warning(f"类别 {class_id} 无法匹配树种 (RGB: R={rgb_stats['mean_red']:.0f}, G={rgb_stats['mean_green']:.0f}, B={rgb_stats['mean_blue']:.0f})")
+                    elif classification_mode == 'ndvi':
+                        ndvi_stats = ndvi_features[class_id]
+                        print_warning(f"类别 {class_id} 无法匹配树种 (NDVI={ndvi_stats['ndvi_mean']:.3f})")
+                    else:
+                        rgb_stats = rgb_features[class_id]
+                        ndvi_stats = ndvi_features[class_id]
+                        print_warning(f"类别 {class_id} 无法匹配树种 (NDVI={ndvi_stats['ndvi_mean']:.3f}, RGB: R={rgb_stats['mean_red']:.0f}, G={rgb_stats['mean_green']:.0f}, B={rgb_stats['mean_blue']:.0f})")
+
+            self.species_labels = species_labels
+            self.n_species = species_code
+
+            # 打印树种统计
+            print_success(f"树种分类完成，共识别 {self.n_species} 个树种类型")
+
+            species_summary = {}
+            for species_key, code in species_mapping.items():
+                mask = (species_labels == code)
+                species_summary[species_key] = {
+                    'name': species_rules[species_key]['name'],
+                    'code': code,
+                    'pixel_count': np.sum(mask),
+                    'carbon_factor': species_rules[species_key]['carbon_factor']
+                }
+                print_info(f"  - {species_rules[species_key]['name']}: {np.sum(mask)} 像素")
+
+            return {
+                'species_mapping': species_mapping,
+                'species_labels': species_labels,
+                'species_summary': species_summary,
+                'species_rules': species_rules
+            }
+
+        else:
+            # 手动映射模式
+            print_info("使用手动映射模式")
+
+            manual_mapping = TREE_SPECIES_CONFIG.get('manual_mapping')
+            if manual_mapping is None:
+                print_error("手动映射模式需要配置 manual_mapping")
+                return None
+
+            species_mapping = {}
+            species_code = 0
+
+            for class_id, species_key in manual_mapping.items():
+                if species_key not in species_mapping:
+                    species_mapping[species_key] = species_code
+                    species_code += 1
+
+                species_labels[self.labels == class_id] = species_mapping[species_key]
+
+            self.species_labels = species_labels
+            self.n_species = species_code
+
+            print_success(f"手动映射完成，共 {self.n_species} 个树种类型")
+
+            return {
+                'species_mapping': species_mapping,
+                'species_labels': species_labels,
+                'n_species': self.n_species
+            }
+
+    def match_by_rgb(self, rgb_stats, species_rules):
+        """
+        基于RGB特征匹配树种
+
+        Parameters:
+        -----------
+        rgb_stats : dict
+            RGB特征统计
+        species_rules : dict
+            树种规则
+
+        Returns:
+        --------
+        tuple
+            (匹配的树种键, 匹配分数)
+        """
+        matched_species = None
+        best_match_score = 0
+
+        for species_key, rule in species_rules.items():
+            rgb_rule = rule['rgb']
+
+            # 检查所有RGB特征是否在范围内
+            checks = [
+                rgb_rule['red_ratio_min'] <= rgb_stats['red_ratio'] <= rgb_rule['red_ratio_max'],
+                rgb_rule['brightness_min'] <= rgb_stats['brightness'] <= rgb_rule['brightness_max'],
+                rgb_rule['saturation_min'] <= rgb_stats['saturation'] <= rgb_rule['saturation_max'],
+                rgb_stats['red_dominance'] >= rgb_rule['red_dominance']
+            ]
+
+            # 如果所有条件都满足，计算综合匹配度
+            if all(checks):
+                # 计算各特征的匹配度（0-1）
+                red_ratio_score = 1.0
+                brightness_score = 1.0 - abs(rgb_stats['brightness'] - (rgb_rule['brightness_min'] + rgb_rule['brightness_max']) / 2) / ((rgb_rule['brightness_max'] - rgb_rule['brightness_min']) / 2)
+                saturation_score = 1.0 - abs(rgb_stats['saturation'] - (rgb_rule['saturation_min'] + rgb_rule['saturation_max']) / 2) / ((rgb_rule['saturation_max'] - rgb_rule['saturation_min']) / 2)
+
+                # 综合匹配度（加权平均）
+                score = (red_ratio_score * 0.3 + brightness_score * 0.35 + saturation_score * 0.35)
+
+                if score > best_match_score:
+                    best_match_score = score
+                    matched_species = species_key
+
+        return matched_species, best_match_score
+
+    def match_by_ndvi(self, ndvi_stats, species_rules):
+        """
+        基于NDVI特征匹配树种
+
+        Parameters:
+        -----------
+        ndvi_stats : dict
+            NDVI特征统计
+        species_rules : dict
+            树种规则
+
+        Returns:
+        --------
+        tuple
+            (匹配的树种键, 匹配分数)
+        """
+        matched_species = None
+        best_match_score = 0
+
+        for species_key, rule in species_rules.items():
+            # 检查NDVI是否在范围内
+            if 'ndvi' in rule:
+                ndvi_min = rule['ndvi']['ndvi_min']
+                ndvi_max = rule['ndvi']['ndvi_max']
+
+                if ndvi_min <= ndvi_stats['ndvi_mean'] <= ndvi_max:
+                    # 计算匹配度（越接近中心值，匹配度越高）
+                    center = (ndvi_min + ndvi_max) / 2
+                    range_width = ndvi_max - ndvi_min
+                    distance = abs(ndvi_stats['ndvi_mean'] - center)
+                    score = 1 - (distance / (range_width / 2)) if range_width > 0 else 1.0
+
+                    if score > best_match_score:
+                        best_match_score = score
+                        matched_species = species_key
+
+        return matched_species, best_match_score
+
+    def match_by_combined(self, rgb_stats, ndvi_stats, species_rules):
+        """
+        结合RGB和NDVI特征匹配树种
+
+        Parameters:
+        -----------
+        rgb_stats : dict
+            RGB特征统计
+        ndvi_stats : dict
+            NDVI特征统计
+        species_rules : dict
+            树种规则
+
+        Returns:
+        --------
+        tuple
+            (匹配的树种键, 匹配分数)
+        """
+        matched_species = None
+        best_match_score = 0
+
+        rgb_weight = TREE_SPECIES_CONFIG.get('rgb_weight', 0.7)
+        ndvi_weight = TREE_SPECIES_CONFIG.get('ndvi_weight', 0.3)
+
+        for species_key, rule in species_rules.items():
+            # RGB匹配
+            rgb_score = 0
+            if 'rgb' in rule:
+                rgb_rule = rule['rgb']
+                checks = [
+                    rgb_rule['red_ratio_min'] <= rgb_stats['red_ratio'] <= rgb_rule['red_ratio_max'],
+                    rgb_rule['brightness_min'] <= rgb_stats['brightness'] <= rgb_rule['brightness_max'],
+                    rgb_rule['saturation_min'] <= rgb_stats['saturation'] <= rgb_rule['saturation_max'],
+                    rgb_stats['red_dominance'] >= rgb_rule['red_dominance']
+                ]
+                if all(checks):
+                    brightness_score = 1.0 - abs(rgb_stats['brightness'] - (rgb_rule['brightness_min'] + rgb_rule['brightness_max']) / 2) / ((rgb_rule['brightness_max'] - rgb_rule['brightness_min']) / 2)
+                    saturation_score = 1.0 - abs(rgb_stats['saturation'] - (rgb_rule['saturation_min'] + rgb_rule['saturation_max']) / 2) / ((rgb_rule['saturation_max'] - rgb_rule['saturation_min']) / 2)
+                    rgb_score = (brightness_score * 0.5 + saturation_score * 0.5)
+
+            # NDVI匹配
+            ndvi_score = 0
+            if 'ndvi' in rule:
+                ndvi_rule = rule['ndvi']
+                if ndvi_rule['ndvi_min'] <= ndvi_stats['ndvi_mean'] <= ndvi_rule['ndvi_max']:
+                    center = (ndvi_rule['ndvi_min'] + ndvi_rule['ndvi_max']) / 2
+                    range_width = ndvi_rule['ndvi_max'] - ndvi_rule['ndvi_min']
+                    distance = abs(ndvi_stats['ndvi_mean'] - center)
+                    ndvi_score = 1 - (distance / (range_width / 2)) if range_width > 0 else 1.0
+
+            # 综合匹配度
+            if rgb_score > 0 or ndvi_score > 0:
+                combined_score = rgb_score * rgb_weight + ndvi_score * ndvi_weight
+
+                if combined_score > best_match_score:
+                    best_match_score = combined_score
+                    matched_species = species_key
+
+        return matched_species, best_match_score
+
+    def load_block_boundaries(self, block_file_path=None):
+        """
+        加载区块边界矢量文件
+
+        Parameters:
+        -----------
+        block_file_path : str
+            区块边界文件路径（.shp），如果为None则使用配置中的路径
+
+        Returns:
+        --------
+        geopandas.GeoDataFrame
+            区块边界数据
+        """
+        if not BLOCK_CONFIG['enable']:
+            print_warning("区块处理功能已禁用")
+            return None
+
+        if block_file_path is None:
+            block_file_path = BLOCK_CONFIG['vector']['file_path']
+
+        if block_file_path is None:
+            print_warning("未提供区块边界文件路径")
+            return None
+
+        try:
+            import geopandas as gpd
+
+            print_info(f"正在加载区块边界文件: {block_file_path}")
+
+            # 读取shapefile
+            blocks_gdf = gpd.read_file(block_file_path)
+
+            print_success(f"成功加载 {len(blocks_gdf)} 个区块")
+
+            # 检查CRS
+            if blocks_gdf.crs is None:
+                print_warning("区块文件没有坐标参考系统（CRS）")
+            else:
+                print_info(f"区块文件CRS: {blocks_gdf.crs}")
+
+            # 检查ID字段
+            id_field = BLOCK_CONFIG['vector']['id_field']
+            if id_field in blocks_gdf.columns:
+                print_info(f"使用ID字段: {id_field}")
+            else:
+                print_warning(f"ID字段 '{id_field}' 不存在，将使用索引")
+
+            # 检查名称字段
+            name_field = BLOCK_CONFIG['vector']['name_field']
+            if name_field in blocks_gdf.columns:
+                print_info(f"使用名称字段: {name_field}")
+            else:
+                print_warning(f"名称字段 '{name_field}' 不存在")
+
+            return blocks_gdf
+
+        except ImportError:
+            print_error("需要安装 geopandas 库: pip install geopandas")
+            return None
+        except Exception as e:
+            print_error(f"加载区块边界文件失败: {e}")
+            return None
+
+    def export_vector_shapefile(self, output_path, blocks_gdf=None):
+        """
+        导出分类结果为Shapefile
+
+        Parameters:
+        -----------
+        output_path : str
+            输出文件路径
+        blocks_gdf : geopandas.GeoDataFrame, optional
+            区块边界数据，如果提供则按区块分割
+
+        Returns:
+        --------
+        bool
+            是否成功导出
+        """
+        if not VECTOR_OUTPUT_CONFIG['enable']:
+            print_warning("矢量输出功能已禁用")
+            return False
+
+        try:
+            import geopandas as gpd
+            from rasterio.features import shapes
+            from shapely.geometry import shape, mapping
+            import pandas as pd
+
+            print_info(f"正在导出Shapefile: {output_path}")
+
+            # 确定使用标签（如果有树种标签则使用树种标签，否则使用聚类标签）
+            if hasattr(self, 'species_labels') and self.species_labels is not None:
+                labels = self.species_labels
+                label_type = 'species'
+                n_labels = self.n_species
+                print_info("使用树种分类结果")
+            else:
+                labels = self.labels
+                label_type = 'class'
+                n_labels = self.n_classes
+                print_info("使用聚类分类结果")
+
+            # 将栅格转换为矢量多边形
+            print_info("正在将栅格转换为矢量多边形...")
+
+            # 创建掩码（排除无效值）
+            mask = (labels >= 0)
+
+            # 使用rasterio.features.shapes生成多边形
+            shapes_list = list(shapes(
+                labels.astype(np.int32),
+                mask=mask,
+                transform=self.profile['transform']
+            ))
+
+            print_info(f"生成了 {len(shapes_list)} 个多边形")
+
+            # 创建属性数据
+            features = []
+            fid = 0
+
+            # 获取像素面积
+            if 'transform' in self.profile:
+                pixel_width = abs(self.profile['transform'][0])
+                pixel_height = abs(self.profile['transform'][4])
+                pixel_area_m2 = pixel_width * pixel_height
+                pixel_area_ha = pixel_area_m2 / 10000
+            else:
+                pixel_area_m2 = 30 * 30  # 默认30m x 30m
+                pixel_area_ha = pixel_area_m2 / 10000
+
+            # 获取树种规则（如果存在）
+            species_rules = None
+            if label_type == 'species' and hasattr(self, 'species_info'):
+                species_rules = self.species_info.get('species_rules', {})
+
+            for geom, label_value in shapes_list:
+                if label_value < 0:
+                    continue
+
+                # 创建shapely几何对象
+                poly = shape(geom)
+
+                # 简化多边形（减少顶点数）
+                simplify_tolerance = VECTOR_OUTPUT_CONFIG['simplify_tolerance']
+                if simplify_tolerance > 0:
+                    poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+                # 计算面积
+                area_m2 = poly.area * (pixel_area_m2 / (poly.area / (pixel_area_m2 if hasattr(poly, 'area') else 1)))
+                area_ha = area_m2 / 10000
+
+                # 过滤太小的斑块
+                min_area = VECTOR_OUTPUT_CONFIG['min_area_hectares']
+                if area_ha < min_area:
+                    continue
+
+                # 计算周长
+                perimeter = poly.length * np.sqrt(pixel_area_m2)
+
+                # 计算复杂度指数
+                complexity = perimeter / (2 * np.pi * np.sqrt(area_m2 / np.pi)) if area_m2 > 0 else 0
+
+                # 获取该类别的NDVI统计
+                # 这里简化处理，实际应该从栅格中提取该多边形区域的NDVI
+                ndvi_mean = self.ndvi[labels == label_value].mean() if hasattr(self, 'ndvi') else 0
+
+                # 创建属性字典
+                properties = {
+                    'FID': fid,
+                    'CLASS_ID': int(label_value),
+                    'AREA_HA': round(area_ha, 4),
+                    'AREA_M2': round(area_m2, 2),
+                    'NDVI_MEAN': round(ndvi_mean, 4),
+                    'NDVI_MIN': round(ndvi_mean, 4),  # 简化处理
+                    'NDVI_MAX': round(ndvi_mean, 4),  # 简化处理
+                    'PERIMETER': round(perimeter, 2),
+                    'COMPLEXITY': round(complexity, 4)
+                }
+
+                # 如果是树种分类，添加树种相关属性
+                if label_type == 'species' and species_rules:
+                    # 反向查找树种
+                    species_key = None
+                    for key, code in self.species_info.get('species_mapping', {}).items():
+                        if code == label_value:
+                            species_key = key
+                            break
+
+                    if species_key and species_key in species_rules:
+                        rule = species_rules[species_key]
+                        properties['SPECIES'] = rule['name']
+                        properties['SPECIES_CODE'] = species_key
+                        properties['CARBON_FACTOR'] = rule['carbon_factor']
+                        # 计算碳汇量
+                        properties['ESTIMATED_CARBON'] = round(area_ha * rule['carbon_factor'], 2)
+                    else:
+                        properties['SPECIES'] = 'Unknown'
+                        properties['SPECIES_CODE'] = 'unknown'
+                        properties['CARBON_FACTOR'] = 0.0
+                        properties['ESTIMATED_CARBON'] = 0.0
+                else:
+                    # 聚类类别
+                    properties['SPECIES'] = f'Class_{label_value}'
+                    properties['SPECIES_CODE'] = f'class_{label_value}'
+                    properties['CARBON_FACTOR'] = 0.0
+                    properties['ESTIMATED_CARBON'] = 0.0
+
+                # 如果有区块边界，添加区块属性
+                if blocks_gdf is not None:
+                    # 找到包含该多边形质心的区块
+                    centroid = poly.centroid
+                    for idx, block in blocks_gdf.iterrows():
+                        if block.geometry.contains(centroid):
+                            properties['BLOCK_ID'] = idx
+                            # 尝试获取区块名称
+                            name_field = BLOCK_CONFIG['vector']['name_field']
+                            if name_field in block:
+                                properties['BLOCK_NAME'] = str(block[name_field])
+                            else:
+                                properties['BLOCK_NAME'] = f'Block_{idx}'
+                            break
+                    else:
+                        properties['BLOCK_ID'] = -1
+                        properties['BLOCK_NAME'] = 'Unknown'
+                else:
+                    properties['BLOCK_ID'] = 0
+                    properties['BLOCK_NAME'] = 'Entire_Area'
+
+                features.append({
+                    'geometry': poly,
+                    'properties': properties
+                })
+
+                fid += 1
+
+            print_info(f"过滤后剩余 {len(features)} 个有效多边形")
+
+            # 创建GeoDataFrame
+            gdf = gpd.GeoDataFrame.from_features(features, crs=self.profile['crs'])
+
+            # 按属性列排序
+            column_order = VECTOR_OUTPUT_CONFIG['attribute_fields']
+            # 只保留存在的列
+            column_order = [col for col in column_order if col in gdf.columns]
+            gdf = gdf[column_order]
+
+            # 保存为Shapefile
+            gdf.to_file(output_path, encoding='utf-8')
+
+            print_success(f"Shapefile已导出: {output_path}")
+            print_info(f"包含 {len(gdf)} 个要素")
+            print_info(f"属性字段: {', '.join(gdf.columns)}")
+
+            return True
+
+        except ImportError as e:
+            print_error(f"缺少必要的库: {e}")
+            print_info("请安装: pip install geopandas shapely")
+            return False
+        except Exception as e:
+            print_error(f"导出Shapefile失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def calculate_block_statistics(self, blocks_gdf):
+        """
+        按区块计算统计信息
+
+        Parameters:
+        -----------
+        blocks_gdf : geopandas.GeoDataFrame
+            区块边界数据
+
+        Returns:
+        --------
+        dict
+            按区块的统计信息
+        """
+        if not BLOCK_CONFIG['enable']:
+            print_warning("区块统计功能已禁用")
+            return None
+
+        if blocks_gdf is None:
+            print_warning("未提供区块边界数据")
+            return None
+
+        print_info("正在计算区块统计信息...")
+
+        try:
+            import geopandas as gpd
+            from rasterio.features import geometry_mask
+            import pandas as pd
+
+            # 确定使用标签
+            if hasattr(self, 'species_labels') and self.species_labels is not None:
+                labels = self.species_labels
+                label_type = 'species'
+                n_labels = self.n_species
+            else:
+                labels = self.labels
+                label_type = 'class'
+                n_labels = self.n_classes
+
+            # 获取像素面积
+            if 'transform' in self.profile:
+                pixel_width = abs(self.profile['transform'][0])
+                pixel_height = abs(self.profile['transform'][4])
+                pixel_area_m2 = pixel_width * pixel_height
+                pixel_area_ha = pixel_area_m2 / 10000
+            else:
+                pixel_area_m2 = 30 * 30
+                pixel_area_ha = pixel_area_m2 / 10000
+
+            # 为每个区块计算统计
+            block_stats = {}
+
+            id_field = BLOCK_CONFIG['vector']['id_field']
+            name_field = BLOCK_CONFIG['vector']['name_field']
+
+            for idx, block in blocks_gdf.iterrows():
+                block_id = block.get(id_field, idx)
+                block_name = block.get(name_field, f'Block_{idx}')
+
+                # 创建区块掩码
+                block_mask = geometry_mask(
+                    [block.geometry],
+                    transform=self.profile['transform'],
+                    invert=True,
+                    out_shape=(self.profile['height'], self.profile['width'])
+                )
+
+                # 提取区块内的标签
+                block_labels = labels[block_mask]
+                block_ndvi = self.ndvi[block_mask]
+
+                # 计算统计
+                total_pixels = np.sum(block_labels >= 0)
+                total_area_ha = total_pixels * pixel_area_ha
+
+                # 按类别统计
+                category_stats = {}
+                for label in range(n_labels):
+                    if label not in block_labels:
+                        continue
+
+                    mask = (block_labels == label)
+                    pixel_count = np.sum(mask)
+                    area_ha = pixel_count * pixel_area_ha
+                    ndvi_mean = block_ndvi[mask].mean() if np.any(mask) else 0
+
+                    category_stats[f'{label_type}_{label}'] = {
+                        'pixel_count': int(pixel_count),
+                        'area_ha': round(area_ha, 4),
+                        'ndvi_mean': round(ndvi_mean, 4),
+                        'coverage_percent': round((pixel_count / total_pixels * 100), 2) if total_pixels > 0 else 0
+                    }
+
+                # 计算碳汇量（如果是树种分类）
+                total_carbon = 0.0
+                if label_type == 'species' and hasattr(self, 'species_info'):
+                    species_mapping = self.species_info.get('species_mapping', {})
+                    species_rules = self.species_info.get('species_rules', {})
+
+                    for species_key, code in species_mapping.items():
+                        if f'species_{code}' in category_stats:
+                            carbon_factor = species_rules[species_key]['carbon_factor']
+                            area = category_stats[f'species_{code}']['area_ha']
+                            carbon = area * carbon_factor
+                            total_carbon += carbon
+
+                            category_stats[f'species_{code}']['carbon_factor'] = carbon_factor
+                            category_stats[f'species_{code}']['estimated_carbon'] = round(carbon, 2)
+
+                # 整体统计
+                block_stats[idx] = {
+                    'block_id': block_id,
+                    'block_name': block_name,
+                    'total_area_ha': round(total_area_ha, 4),
+                    'total_pixels': int(total_pixels),
+                    'mean_ndvi': round(block_ndvi[block_labels >= 0].mean(), 4) if np.any(block_labels >= 0) else 0,
+                    'category_stats': category_stats,
+                    'total_carbon_tons': round(total_carbon, 2),
+                    'carbon_density_tons_per_ha': round(total_carbon / total_area_ha, 2) if total_area_ha > 0 else 0
+                }
+
+                print_info(f"区块 {block_name}: 总面积={total_area_ha:.2f}公顷, "
+                         f"碳汇量={total_carbon:.2f}吨")
+
+            print_success(f"区块统计完成，共 {len(block_stats)} 个区块")
+
+            return block_stats
+
+        except Exception as e:
+            print_error(f"计算区块统计失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def calculate_statistics(self, class_info):
         """
         计算森林覆盖率和面积
@@ -1050,6 +1835,47 @@ def parse_args():
                               default=PARALLEL_CONFIG['max_memory_mb'],
                               help='最大内存限制MB')
 
+    # 树种分类参数
+    species_group = parser.add_argument_group('树种分类参数')
+    species_group.add_argument('--no-species', action='store_true',
+                              help='禁用树种分类')
+    species_group.add_argument('--species-manual', action='store_true',
+                              help='使用手动树种映射模式')
+    species_group.add_argument('--combined-ndvi', action='store_true',
+                              help='使用综合模式（RGB颜色特征 + NDVI），默认仅使用RGB颜色特征')
+
+    # 区块处理参数
+    block_group = parser.add_argument_group('区块处理参数')
+    block_group.add_argument('--no-block', action='store_true',
+                            help='禁用区块处理')
+    block_group.add_argument('--block-file', type=str,
+                            help='区块边界文件路径（.shp）')
+    block_group.add_argument('--block-id-field', type=str,
+                            default=BLOCK_CONFIG['vector']['id_field'],
+                            help='区块ID字段名')
+    block_group.add_argument('--block-name-field', type=str,
+                            default=BLOCK_CONFIG['vector']['name_field'],
+                            help='区块名称字段名')
+
+    # 矢量输出参数
+    vector_group = parser.add_argument_group('矢量输出参数')
+    vector_group.add_argument('--no-vector', action='store_true',
+                             help='禁用矢量输出')
+    vector_group.add_argument('--vector-file', type=str,
+                             default=VECTOR_OUTPUT_CONFIG['output_file'],
+                             help='输出Shapefile文件名')
+    vector_group.add_argument('--simplify-tolerance', type=float,
+                             default=VECTOR_OUTPUT_CONFIG['simplify_tolerance'],
+                             help='多边形简化容差（米）')
+    vector_group.add_argument('--min-area', type=float,
+                             default=VECTOR_OUTPUT_CONFIG['min_area_hectares'],
+                             help='最小面积阈值（公顷）')
+
+    # 碳汇计算参数
+    carbon_group = parser.add_argument_group('碳汇计算参数')
+    carbon_group.add_argument('--no-carbon', action='store_true',
+                             help='禁用碳汇计算')
+
     return parser.parse_args()
 
 
@@ -1227,6 +2053,75 @@ def interactive_input():
     else:
         args.max_memory = float(args.max_memory)
 
+    # 树种分类参数
+    print(f"\n{Fore.YELLOW}【树种分类】{Style.RESET_ALL}")
+    use_species = input(f"启用树种分类？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_species = (use_species == 'n' or use_species == 'no')
+
+    if not args.no_species:
+        use_auto = input(f"使用自动分类模式？ [Y/n] (默认: Y): ").strip().lower()
+        args.species_manual = (use_auto == 'n' or use_auto == 'no')
+
+        if not args.species_manual:
+            # 询问是否结合NDVI判断
+            print(f"\n{Fore.CYAN}  分类模式说明:{Style.RESET_ALL}")
+            print(f"  - 仅使用颜色特征: 基于432假彩色合成的RGB颜色特征判断（推荐）")
+            print(f"  - 结合NDVI判断: 同时使用RGB颜色特征和NDVI植被指数判断")
+            use_ndvi = input(f"  是否结合NDVI判断？ [y/N] (默认: N): ").strip().lower()
+            if use_ndvi == 'y' or use_ndvi == 'yes':
+                args.combined_ndvi = True
+                print(f"  {Fore.GREEN}✓ 使用综合模式（RGB + NDVI）{Style.RESET_ALL}")
+            else:
+                args.combined_ndvi = False
+                print(f"  {Fore.GREEN}✓ 使用RGB模式（仅颜色特征）{Style.RESET_ALL}")
+        else:
+            args.combined_ndvi = False
+
+    # 区块处理参数
+    print(f"\n{Fore.YELLOW}【区块处理】{Style.RESET_ALL}")
+    use_block = input(f"启用区块处理？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_block = (use_block == 'n' or use_block == 'no')
+
+    if not args.no_block:
+        args.block_file = input(f"区块边界文件路径 (.shp，可选): ").strip()
+        if not args.block_file:
+            args.block_file = None
+        else:
+            args.block_id_field = input(f"区块ID字段名 [{BLOCK_CONFIG['vector']['id_field']}]: ").strip()
+            if not args.block_id_field:
+                args.block_id_field = BLOCK_CONFIG['vector']['id_field']
+
+            args.block_name_field = input(f"区块名称字段名 [{BLOCK_CONFIG['vector']['name_field']}]: ").strip()
+            if not args.block_name_field:
+                args.block_name_field = BLOCK_CONFIG['vector']['name_field']
+
+    # 矢量输出参数
+    print(f"\n{Fore.YELLOW}【矢量输出】{Style.RESET_ALL}")
+    use_vector = input(f"导出Shapefile？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_vector = (use_vector == 'n' or use_vector == 'no')
+
+    if not args.no_vector:
+        args.vector_file = input(f"输出文件名 [{VECTOR_OUTPUT_CONFIG['output_file']}]: ").strip()
+        if not args.vector_file:
+            args.vector_file = VECTOR_OUTPUT_CONFIG['output_file']
+
+        simplify_tol = input(f"多边形简化容差（米）[{VECTOR_OUTPUT_CONFIG['simplify_tolerance']}]: ").strip()
+        if not simplify_tol:
+            args.simplify_tolerance = VECTOR_OUTPUT_CONFIG['simplify_tolerance']
+        else:
+            args.simplify_tolerance = float(simplify_tol)
+
+        min_area = input(f"最小面积阈值（公顷）[{VECTOR_OUTPUT_CONFIG['min_area_hectares']}]: ").strip()
+        if not min_area:
+            args.min_area = VECTOR_OUTPUT_CONFIG['min_area_hectares']
+        else:
+            args.min_area = float(min_area)
+
+    # 碳汇计算参数
+    print(f"\n{Fore.YELLOW}【碳汇计算】{Style.RESET_ALL}")
+    use_carbon = input(f"启用碳汇计算？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_carbon = (use_carbon == 'n' or use_carbon == 'no')
+
     print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}配置完成！即将开始处理...{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
@@ -1311,15 +2206,45 @@ def main(input_tif, config=None):
         classifier.post_process()
 
         # 步骤5：识别森林类别
-        print_step(5, 7, "识别森林类别")
+        print_step(5, 9, "识别森林类别")
         class_info = classifier.identify_forest_classes()
 
-        # 步骤6：计算统计结果
-        print_step(6, 7, "计算森林覆盖率")
+        # 步骤6：树种分类（如果启用）
+        species_info = None
+        blocks_gdf = None
+        block_stats = None
+
+        if TREE_SPECIES_CONFIG['enable']:
+            print_step(6, 9, "树种分类")
+            species_info = classifier.map_tree_species()
+            if species_info:
+                classifier.species_info = species_info
+                print_success("树种分类完成")
+
+        # 步骤7：加载区块边界（如果启用）
+        if BLOCK_CONFIG['enable'] and BLOCK_CONFIG['vector']['file_path']:
+            print_step(7, 9, "加载区块边界")
+            blocks_gdf = classifier.load_block_boundaries()
+            if blocks_gdf is not None:
+                print_success(f"成功加载 {len(blocks_gdf)} 个区块")
+
+        # 步骤8：计算统计结果
+        print_step(8, 9, "计算森林覆盖率")
         statistics = classifier.calculate_statistics(class_info)
 
-        # 步骤7：保存结果
-        print_step(7, 7, "保存结果文件")
+        # 如果有区块，计算区块统计
+        if blocks_gdf is not None:
+            print_info("正在计算区块统计...")
+            block_stats = classifier.calculate_block_statistics(blocks_gdf)
+            if block_stats:
+                # 保存区块统计
+                block_stats_file = os.path.join(output_dir, 'block_statistics.json')
+                with open(block_stats_file, 'w', encoding='utf-8') as f:
+                    json.dump(block_stats, f, indent=2, ensure_ascii=False)
+                print_success(f"区块统计已保存: {block_stats_file}")
+
+        # 步骤9：保存结果
+        print_step(9, 9, "保存结果文件")
 
         # 保存分类结果
         classified_output = os.path.join(output_dir, OUTPUT_CONFIG['classified_file'])
@@ -1343,6 +2268,12 @@ def main(input_tif, config=None):
         df = pd.DataFrame([statistics])
         df.to_csv(report_output, index=False, encoding='utf-8-sig')
         print_success(f"CSV报告已保存: {report_output}")
+
+        # 导出Shapefile（如果启用）
+        if VECTOR_OUTPUT_CONFIG['enable']:
+            print_info("正在导出矢量数据...")
+            vector_output = os.path.join(output_dir, VECTOR_OUTPUT_CONFIG['output_file'])
+            classifier.export_vector_shapefile(vector_output, blocks_gdf)
 
         # 可视化
         if OUTPUT_CONFIG['visualization']:
@@ -1457,8 +2388,48 @@ if __name__ == '__main__':
             'feature_extraction_n_jobs': args.n_jobs,
             'post_process_n_jobs': args.n_jobs,
             'max_memory_mb': args.max_memory,
+        },
+        'tree_species': {
+            'enable': not args.no_species,
+            'auto_classification': not getattr(args, 'species_manual', False),
+            'classification_mode': 'combined' if getattr(args, 'combined_ndvi', False) else 'rgb',
+        },
+        'block': {
+            'enable': not args.no_block,
+            'vector': {
+                'file_path': getattr(args, 'block_file', None),
+                'id_field': getattr(args, 'block_id_field', BLOCK_CONFIG['vector']['id_field']),
+                'name_field': getattr(args, 'block_name_field', BLOCK_CONFIG['vector']['name_field']),
+            }
+        },
+        'vector_output': {
+            'enable': not args.no_vector,
+            'output_file': getattr(args, 'vector_file', VECTOR_OUTPUT_CONFIG['output_file']),
+            'simplify_tolerance': getattr(args, 'simplify_tolerance', VECTOR_OUTPUT_CONFIG['simplify_tolerance']),
+            'min_area_hectares': getattr(args, 'min_area', VECTOR_OUTPUT_CONFIG['min_area_hectares']),
+        },
+        'carbon': {
+            'enable': not args.no_carbon,
         }
     }
+
+    # 更新全局配置
+    TREE_SPECIES_CONFIG['enable'] = config['tree_species']['enable']
+    TREE_SPECIES_CONFIG['auto_classification'] = config['tree_species']['auto_classification']
+    TREE_SPECIES_CONFIG['classification_mode'] = config['tree_species']['classification_mode']
+
+    BLOCK_CONFIG['enable'] = config['block']['enable']
+    if config['block']['vector']['file_path']:
+        BLOCK_CONFIG['vector']['file_path'] = config['block']['vector']['file_path']
+        BLOCK_CONFIG['vector']['id_field'] = config['block']['vector']['id_field']
+        BLOCK_CONFIG['vector']['name_field'] = config['block']['vector']['name_field']
+
+    VECTOR_OUTPUT_CONFIG['enable'] = config['vector_output']['enable']
+    VECTOR_OUTPUT_CONFIG['output_file'] = config['vector_output']['output_file']
+    VECTOR_OUTPUT_CONFIG['simplify_tolerance'] = config['vector_output']['simplify_tolerance']
+    VECTOR_OUTPUT_CONFIG['min_area_hectares'] = config['vector_output']['min_area_hectares']
+
+    CARBON_CALCULATION_CONFIG['enable'] = config['carbon']['enable']
 
     # 如果有前缀，修改输出文件名
     if args.prefix:
