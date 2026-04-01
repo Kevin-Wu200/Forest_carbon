@@ -51,6 +51,7 @@ OUTPUT_CONFIG = {
     'statistics_file': 'statistics.json',
     'report_file': 'report.csv',
     'visualization': True,        # 是否生成可视化结果
+    'save_ndvi': True,            # 是否保存NDVI文件
 }
 
 # 单位面积（用于面积计算）

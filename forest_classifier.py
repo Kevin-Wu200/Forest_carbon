@@ -13,6 +13,7 @@ import os
 import json
 import pandas as pd
 from datetime import datetime
+import argparse
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
@@ -348,15 +349,13 @@ class ForestClassifier:
 
         # 执行K-means聚类（添加verbose=True显示迭代信息）
         print_info(f"聚类参数: K={self.config['n_clusters']}, n_init={self.config['n_init']}, max_iter={self.config['max_iter']}")
-        print_info(f"并行进程数: {self.parallel_config['kmeans_n_jobs']}")
 
         kmeans = KMeans(
             n_clusters=self.config['n_clusters'],
             random_state=self.config['random_state'],
             n_init=self.config['n_init'],
             max_iter=self.config['max_iter'],
-            verbose=1,
-            n_jobs=self.parallel_config['kmeans_n_jobs']  # 添加并行参数
+            verbose=1
         )
 
         print_info("正在进行聚类训练...")
@@ -545,15 +544,13 @@ class ForestClassifier:
 
         # 使用K-means对超像素进行聚类
         print_info("正在进行超像素聚类...")
-        print_info(f"并行进程数: {self.parallel_config['kmeans_n_jobs']}")
 
         kmeans = KMeans(
             n_clusters=self.config['n_clusters'],
             random_state=self.config['random_state'],
             n_init=self.config['n_init'],
             max_iter=self.config['max_iter'],
-            verbose=1,
-            n_jobs=self.parallel_config['kmeans_n_jobs']  # 添加并行参数
+            verbose=1
         )
 
         superpixel_labels = kmeans.fit_predict(features_normalized)
@@ -958,7 +955,286 @@ class ForestClassifier:
         print_success(f"可视化结果已保存: {output_path}")
 
 
-def main(input_tif):
+def parse_args():
+    """
+    解析命令行参数
+
+    Returns:
+    --------
+    argparse.Namespace
+        解析后的参数
+    """
+    parser = argparse.ArgumentParser(
+        description='森林非监督分类系统 - 基于K-means和SLIC算法的多光谱遥感影像分类',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # 输入输出参数
+    parser.add_argument('input', help='输入TIF文件路径')
+    parser.add_argument('-o', '--output-dir', default=OUTPUT_CONFIG['output_dir'],
+                       help='输出目录')
+    parser.add_argument('--prefix', default='',
+                       help='输出文件前缀')
+
+    # 分类算法参数
+    parser.add_argument('-a', '--algorithm', choices=['slic', 'kmeans'],
+                       default=CLASSIFICATION_CONFIG['algorithm'],
+                       help='分类算法')
+    parser.add_argument('-k', '--n-clusters', type=int,
+                       default=CLASSIFICATION_CONFIG['n_clusters'],
+                       help='聚类数量')
+    parser.add_argument('--random-state', type=int,
+                       default=CLASSIFICATION_CONFIG['random_state'],
+                       help='随机种子')
+    parser.add_argument('--n-init', type=int,
+                       default=CLASSIFICATION_CONFIG['n_init'],
+                       help='K-means重复次数')
+    parser.add_argument('--max-iter', type=int,
+                       default=CLASSIFICATION_CONFIG['max_iter'],
+                       help='最大迭代次数')
+
+    # SLIC参数
+    slic_group = parser.add_argument_group('SLIC超像素参数')
+    slic_group.add_argument('--n-segments', type=int,
+                           default=SLIC_CONFIG['n_segments'],
+                           help='超像素数量')
+    slic_group.add_argument('--compactness', type=float,
+                           default=SLIC_CONFIG['compactness'],
+                           help='紧凑度参数')
+    slic_group.add_argument('--slic-max-iter', type=int,
+                           default=SLIC_CONFIG['max_num_iter'],
+                           help='SLIC最大迭代次数')
+    slic_group.add_argument('--sigma', type=float,
+                           default=SLIC_CONFIG['sigma'],
+                           help='高斯平滑标准差')
+
+    # NDVI阈值参数
+    ndvi_group = parser.add_argument_group('NDVI阈值参数')
+    ndvi_group.add_argument('--forest-ndvi', type=float,
+                          default=NDVI_THRESHOLDS['forest_min'],
+                          help='森林NDVI最小值')
+    ndvi_group.add_argument('--arbor-forest-ndvi', type=float,
+                          default=NDVI_THRESHOLDS['arbor_forest_min'],
+                          help='乔木林NDVI最小值')
+
+    # 波段配置参数
+    band_group = parser.add_argument_group('波段配置')
+    band_group.add_argument('--red-band', type=int,
+                          default=BAND_INDICES['red'],
+                          help='红光波段索引（从0开始）')
+    band_group.add_argument('--nir-band', type=int,
+                          default=BAND_INDICES['nir'],
+                          help='近红外波段索引（从0开始）')
+
+    # 后处理参数
+    post_group = parser.add_argument_group('后处理参数')
+    post_group.add_argument('--min-patch-size', type=int,
+                           default=POST_PROCESSING['min_patch_size'],
+                           help='最小斑块大小（像素数）')
+    post_group.add_argument('--no-post-process', action='store_true',
+                           help='禁用后处理')
+
+    # 输出控制参数
+    output_group = parser.add_argument_group('输出控制')
+    output_group.add_argument('--no-visualization', action='store_true',
+                            help='禁用可视化')
+    output_group.add_argument('--no-ndvi', action='store_true',
+                            help='不保存NDVI文件')
+
+    # 并行处理参数
+    parallel_group = parser.add_argument_group('并行处理')
+    parallel_group.add_argument('-j', '--n-jobs', type=int,
+                              default=PARALLEL_CONFIG['n_jobs'],
+                              help='并行进程数（-1表示使用所有CPU核心）')
+    parallel_group.add_argument('--max-memory', type=float,
+                              default=PARALLEL_CONFIG['max_memory_mb'],
+                              help='最大内存限制MB')
+
+    return parser.parse_args()
+
+
+def interactive_input():
+    """
+    交互式获取用户输入
+
+    Returns:
+    --------
+    argparse.Namespace
+        解析后的参数
+    """
+    print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}森林非监督分类系统 - 交互式配置{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+
+    # 创建一个 Namespace 对象来存储所有参数
+    args = argparse.Namespace()
+
+    # 输入输出参数
+    print(f"{Fore.YELLOW}【输入输出配置】{Style.RESET_ALL}")
+    while True:
+        default_file = ""
+        if os.path.exists('20201023.tif'):
+            default_file = "20201023.tif"
+        input_path = input(f"输入TIF文件路径 [{default_file}]: ").strip()
+        if not input_path:
+            input_path = default_file
+        if input_path and os.path.exists(input_path):
+            args.input = input_path
+            break
+        print(f"{Fore.RED}错误: 文件不存在，请重新输入{Style.RESET_ALL}")
+
+    args.output_dir = input(f"输出目录 [{OUTPUT_CONFIG['output_dir']}]: ").strip()
+    if not args.output_dir:
+        args.output_dir = OUTPUT_CONFIG['output_dir']
+
+    args.prefix = input("输出文件前缀 (可选): ").strip()
+
+    # 分类算法参数
+    print(f"\n{Fore.YELLOW}【分类算法配置】{Style.RESET_ALL}")
+    print(f"  1. SLIC超像素分割 (推荐)")
+    print(f"  2. K-means聚类")
+    while True:
+        choice = input(f"选择分类算法 [1-2] (默认: 1): ").strip()
+        if not choice:
+            args.algorithm = 'slic'
+            break
+        if choice == '1':
+            args.algorithm = 'slic'
+            break
+        elif choice == '2':
+            args.algorithm = 'kmeans'
+            break
+        print(f"{Fore.RED}错误: 请输入 1 或 2{Style.RESET_ALL}")
+
+    args.n_clusters = input(f"聚类数量 [{CLASSIFICATION_CONFIG['n_clusters']}]: ").strip()
+    if not args.n_clusters:
+        args.n_clusters = CLASSIFICATION_CONFIG['n_clusters']
+    else:
+        args.n_clusters = int(args.n_clusters)
+
+    args.random_state = input(f"随机种子 [{CLASSIFICATION_CONFIG['random_state']}]: ").strip()
+    if not args.random_state:
+        args.random_state = CLASSIFICATION_CONFIG['random_state']
+    else:
+        args.random_state = int(args.random_state)
+
+    args.n_init = input(f"K-means重复次数 [{CLASSIFICATION_CONFIG['n_init']}]: ").strip()
+    if not args.n_init:
+        args.n_init = CLASSIFICATION_CONFIG['n_init']
+    else:
+        args.n_init = int(args.n_init)
+
+    args.max_iter = input(f"最大迭代次数 [{CLASSIFICATION_CONFIG['max_iter']}]: ").strip()
+    if not args.max_iter:
+        args.max_iter = CLASSIFICATION_CONFIG['max_iter']
+    else:
+        args.max_iter = int(args.max_iter)
+
+    # SLIC参数（仅在选择SLIC时询问）
+    if args.algorithm == 'slic':
+        print(f"\n{Fore.YELLOW}【SLIC超像素参数】{Style.RESET_ALL}")
+        args.n_segments = input(f"超像素数量 [{SLIC_CONFIG['n_segments']}]: ").strip()
+        if not args.n_segments:
+            args.n_segments = SLIC_CONFIG['n_segments']
+        else:
+            args.n_segments = int(args.n_segments)
+
+        args.compactness = input(f"紧凑度参数 [{SLIC_CONFIG['compactness']}]: ").strip()
+        if not args.compactness:
+            args.compactness = SLIC_CONFIG['compactness']
+        else:
+            args.compactness = float(args.compactness)
+
+        args.slic_max_iter = input(f"SLIC最大迭代次数 [{SLIC_CONFIG['max_num_iter']}]: ").strip()
+        if not args.slic_max_iter:
+            args.slic_max_iter = SLIC_CONFIG['max_num_iter']
+        else:
+            args.slic_max_iter = int(args.slic_max_iter)
+
+        args.sigma = input(f"高斯平滑标准差 [{SLIC_CONFIG['sigma']}]: ").strip()
+        if not args.sigma:
+            args.sigma = SLIC_CONFIG['sigma']
+        else:
+            args.sigma = float(args.sigma)
+    else:
+        # K-means时使用SLIC默认值
+        args.n_segments = SLIC_CONFIG['n_segments']
+        args.compactness = SLIC_CONFIG['compactness']
+        args.slic_max_iter = SLIC_CONFIG['max_num_iter']
+        args.sigma = SLIC_CONFIG['sigma']
+
+    # NDVI阈值参数
+    print(f"\n{Fore.YELLOW}【NDVI阈值参数】{Style.RESET_ALL}")
+    args.forest_ndvi = input(f"森林NDVI最小值 [{NDVI_THRESHOLDS['forest_min']}]: ").strip()
+    if not args.forest_ndvi:
+        args.forest_ndvi = NDVI_THRESHOLDS['forest_min']
+    else:
+        args.forest_ndvi = float(args.forest_ndvi)
+
+    args.arbor_forest_ndvi = input(f"乔木林NDVI最小值 [{NDVI_THRESHOLDS['arbor_forest_min']}]: ").strip()
+    if not args.arbor_forest_ndvi:
+        args.arbor_forest_ndvi = NDVI_THRESHOLDS['arbor_forest_min']
+    else:
+        args.arbor_forest_ndvi = float(args.arbor_forest_ndvi)
+
+    # 波段配置参数
+    print(f"\n{Fore.YELLOW}【波段配置】{Style.RESET_ALL}")
+    print(f"  Landsat 8: Red=3, NIR=4")
+    print(f"  Sentinel-2: Red=3, NIR=7")
+    args.red_band = input(f"红光波段索引 [{BAND_INDICES['red']}]: ").strip()
+    if not args.red_band:
+        args.red_band = BAND_INDICES['red']
+    else:
+        args.red_band = int(args.red_band)
+
+    args.nir_band = input(f"近红外波段索引 [{BAND_INDICES['nir']}]: ").strip()
+    if not args.nir_band:
+        args.nir_band = BAND_INDICES['nir']
+    else:
+        args.nir_band = int(args.nir_band)
+
+    # 后处理参数
+    print(f"\n{Fore.YELLOW}【后处理参数】{Style.RESET_ALL}")
+    args.min_patch_size = input(f"最小斑块大小（像素数）[{POST_PROCESSING['min_patch_size']}]: ").strip()
+    if not args.min_patch_size:
+        args.min_patch_size = POST_PROCESSING['min_patch_size']
+    else:
+        args.min_patch_size = int(args.min_patch_size)
+
+    use_post = input(f"启用后处理？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_post_process = (use_post == 'n' or use_post == 'no')
+
+    # 输出控制参数
+    print(f"\n{Fore.YELLOW}【输出控制】{Style.RESET_ALL}")
+    use_vis = input(f"生成可视化结果？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_visualization = (use_vis == 'n' or use_vis == 'no')
+
+    use_ndvi = input(f"保存NDVI文件？ [Y/n] (默认: Y): ").strip().lower()
+    args.no_ndvi = (use_ndvi == 'n' or use_ndvi == 'no')
+
+    # 并行处理参数
+    print(f"\n{Fore.YELLOW}【并行处理】{Style.RESET_ALL}")
+    print(f"  当前系统CPU核心数: {PARALLEL_CONFIG['n_jobs']}")
+    args.n_jobs = input(f"并行进程数 (默认: 使用所有核心): ").strip()
+    if not args.n_jobs:
+        args.n_jobs = PARALLEL_CONFIG['n_jobs']
+    else:
+        args.n_jobs = int(args.n_jobs)
+
+    args.max_memory = input(f"最大内存限制MB [{PARALLEL_CONFIG['max_memory_mb']:.0f}]: ").strip()
+    if not args.max_memory:
+        args.max_memory = PARALLEL_CONFIG['max_memory_mb']
+    else:
+        args.max_memory = float(args.max_memory)
+
+    print(f"\n{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}配置完成！即将开始处理...{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+
+    return args
+
+
+def main(input_tif, config=None):
     """
     主函数：执行完整的分类流程
 
@@ -966,8 +1242,21 @@ def main(input_tif):
     -----------
     input_tif : str
         输入TIF文件路径
+    config : dict, optional
+        配置参数字典，如果提供则覆盖默认配置
     """
     global _current_executor
+
+    # 如果提供了配置，则使用它来覆盖默认配置
+    if config is not None:
+        # 更新分类配置
+        CLASSIFICATION_CONFIG.update(config.get('classification', {}))
+        SLIC_CONFIG.update(config.get('slic', {}))
+        NDVI_THRESHOLDS.update(config.get('ndvi', {}))
+        BAND_INDICES.update(config.get('bands', {}))
+        POST_PROCESSING.update(config.get('post_process', {}))
+        OUTPUT_CONFIG.update(config.get('output', {}))
+        PARALLEL_CONFIG.update(config.get('parallel', {}))
 
     try:
         print_header("森林非监督分类系统")
@@ -1036,9 +1325,12 @@ def main(input_tif):
         classified_output = os.path.join(output_dir, OUTPUT_CONFIG['classified_file'])
         classifier.save_classified_tif(classified_output)
 
-        # 保存NDVI
-        ndvi_output = os.path.join(output_dir, OUTPUT_CONFIG['ndvi_file'])
-        classifier.save_ndvi_tif(ndvi_output)
+        # 保存NDVI（如果配置允许）
+        if OUTPUT_CONFIG.get('save_ndvi', True):
+            ndvi_output = os.path.join(output_dir, OUTPUT_CONFIG['ndvi_file'])
+            classifier.save_ndvi_tif(ndvi_output)
+        else:
+            print_warning("NDVI文件保存已禁用")
 
         # 保存统计结果
         stats_output = os.path.join(output_dir, OUTPUT_CONFIG['statistics_file'])
@@ -1112,14 +1404,69 @@ def main(input_tif):
 if __name__ == '__main__':
     import sys
 
-    if len(sys.argv) < 2:
-        print("使用方法: python forest_classifier.py <输入TIF文件路径>")
-        print("示例: python forest_classifier.py input.tif")
+    # 检测运行模式：只有当第一个参数是以 '-' 开头的选项时才使用命令行模式
+    # 否则（包括只提供文件名或无参数）进入交互式模式
+    if len(sys.argv) > 1 and sys.argv[1].startswith('-'):
+        # 命令行模式：解析命令行参数
+        args = parse_args()
+    else:
+        # 交互式模式：通过询问获取参数
+        args = interactive_input()
+
+    # 检查输入文件是否存在
+    if not os.path.exists(args.input):
+        print(f"错误: 文件不存在 - {args.input}")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    if not os.path.exists(input_file):
-        print(f"错误: 文件不存在 - {input_file}")
-        sys.exit(1)
+    # 构建配置字典
+    config = {
+        'classification': {
+            'algorithm': args.algorithm,
+            'n_clusters': args.n_clusters,
+            'random_state': args.random_state,
+            'n_init': args.n_init,
+            'max_iter': args.max_iter,
+        },
+        'slic': {
+            'n_segments': args.n_segments,
+            'compactness': args.compactness,
+            'max_num_iter': args.slic_max_iter,
+            'sigma': args.sigma,
+        },
+        'ndvi': {
+            'forest_min': args.forest_ndvi,
+            'arbor_forest_min': args.arbor_forest_ndvi,
+        },
+        'bands': {
+            'red': args.red_band,
+            'nir': args.nir_band,
+        },
+        'post_process': {
+            'min_patch_size': args.min_patch_size,
+            'use_majority_filter': not args.no_post_process,
+        },
+        'output': {
+            'output_dir': args.output_dir,
+            'visualization': not args.no_visualization,
+            'save_ndvi': not args.no_ndvi,
+        },
+        'parallel': {
+            'n_jobs': args.n_jobs,
+            'kmeans_n_jobs': args.n_jobs,
+            'slic_n_jobs': args.n_jobs,
+            'feature_extraction_n_jobs': args.n_jobs,
+            'post_process_n_jobs': args.n_jobs,
+            'max_memory_mb': args.max_memory,
+        }
+    }
 
-    main(input_file)
+    # 如果有前缀，修改输出文件名
+    if args.prefix:
+        prefix = args.prefix
+        config['output']['classified_file'] = f"{prefix}_classified.tif"
+        config['output']['ndvi_file'] = f"{prefix}_ndvi.tif"
+        config['output']['statistics_file'] = f"{prefix}_statistics.json"
+        config['output']['report_file'] = f"{prefix}_report.csv"
+
+    # 调用主函数
+    main(args.input, config)
