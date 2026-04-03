@@ -46,10 +46,10 @@ POST_PROCESSING = {
 # 输出设置
 OUTPUT_CONFIG = {
     'output_dir': 'output',
-    'classified_file': 'classified.tif',
-    'ndvi_file': 'ndvi.tif',
-    'statistics_file': 'statistics.json',
-    'report_file': 'report.csv',
+    'classified_file': '分类结果.tif',
+    'ndvi_file': '植被指数.tif',
+    'statistics_file': '统计数据.json',
+    'report_file': '分析报告.csv',
     'visualization': True,        # 是否生成可视化结果
     'save_ndvi': True,            # 是否保存NDVI文件
 }
@@ -243,7 +243,7 @@ VECTOR_OUTPUT_CONFIG = {
     'output_format': 'shapefile', # 输出格式: 'shapefile' / 'geojson'
 
     # 输出文件
-    'output_file': 'forest_species_blocks.shp',
+    'output_file': '森林树种区块.shp',
 
     # 多边形处理
     'simplify_tolerance': 5.0,    # 简化容差（米），用于减少多边形顶点数
@@ -285,7 +285,7 @@ CARBON_CALCULATION_CONFIG = {
     'season_factor': 1.0,         # 季节因子，考虑季节变化
 
     # 碳汇报告
-    'report_file': 'carbon_report.csv',  # 碳汇报告文件名
+    'report_file': '碳汇报告.csv',  # 碳汇报告文件名
 }
 
 
@@ -350,20 +350,20 @@ MAX_SAFE_MEMORY_MB = MEMORY_INFO['total_mb'] * 0.5
 # 并行处理配置
 PARALLEL_CONFIG = {
     # CPU并行度配置（充分利用CPU）
-    'n_jobs': CPU_COUNT,  # 使用所有CPU核心
-    'max_workers': CPU_COUNT,  # 最大工作线程数
+    'n_jobs': 1,  # 使用单进程（多进程对于小任务开销太大）
+    'max_workers': 1,  # 最大工作线程数
 
     # K-means并行配置
-    'kmeans_n_jobs': CPU_COUNT,  # 使用所有核心
+    'kmeans_n_jobs': 1,  # 使用单进程
 
     # SLIC并行配置（skimage的slic不支持n_jobs，但其他操作可以并行）
-    'slic_n_jobs': CPU_COUNT,
+    'slic_n_jobs': 1,
 
     # 后处理并行配置
-    'post_process_n_jobs': CPU_COUNT,  # 使用所有核心
+    'post_process_n_jobs': 1,  # 使用单进程
 
     # 超像素特征提取并行配置
-    'feature_extraction_n_jobs': CPU_COUNT,  # 使用所有核心
+    'feature_extraction_n_jobs': 1,  # 使用单进程
 
     # 内存控制配置
     'max_memory_mb': MAX_SAFE_MEMORY_MB,

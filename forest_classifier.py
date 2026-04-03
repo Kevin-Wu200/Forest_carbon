@@ -105,6 +105,79 @@ def print_header(text):
     print(f"{Fore.BLUE}{Style.BRIGHT}{'='*60}{Style.RESET_ALL}\n")
 
 
+def extract_single_superpixel_features(sp_id, segments, data, ndvi, n_bands):
+    """
+    提取单个超像素的特征（模块级别函数，支持多进程 pickle）
+
+    Parameters:
+    -----------
+    sp_id : int
+        超像素ID
+    segments : np.ndarray
+        超像素标签矩阵
+    data : np.ndarray
+        原始影像数据
+    ndvi : np.ndarray
+        NDVI数据
+    n_bands : int
+        波段数
+
+    Returns:
+    --------
+    tuple
+        (超像素ID, 特征向量)
+    """
+    mask = (segments == sp_id)
+    features = []
+
+    # 计算每个波段的平均值
+    for band_idx in range(n_bands):
+        band_data = data[band_idx][mask]
+        mean_value = np.mean(band_data) if len(band_data) > 0 else 0
+        features.append(mean_value)
+
+    # 添加NDVI特征
+    ndvi_values = ndvi[mask]
+    # 排除NaN值（零值掩膜）
+    valid_ndvi = ndvi_values[~np.isnan(ndvi_values)]
+    if len(valid_ndvi) > 0:
+        mean_ndvi = np.mean(valid_ndvi)
+    else:
+        mean_ndvi = 0
+    features.append(mean_ndvi)
+
+    return sp_id, features
+
+
+def process_single_class(label, labels, min_patch):
+    """
+    处理单个类别的小斑块（模块级别函数，支持多进程 pickle）
+
+    Parameters:
+    -----------
+    label : int
+        类别标签
+    labels : np.ndarray
+        标签矩阵
+    min_patch : int
+        最小斑块大小
+
+    Returns:
+    --------
+    tuple
+        (类别标签, 小斑块列表)
+    """
+    mask = (labels == label).astype(np.uint8)
+    labeled_array, num_features = ndimage.label(mask)
+
+    small_patches = []
+    for i in range(1, num_features + 1):
+        if np.sum(labeled_array == i) < min_patch:
+            small_patches.append(labeled_array == i)
+
+    return label, small_patches
+
+
 class ForestClassifier:
     """森林分类器类"""
 
@@ -254,6 +327,8 @@ class ForestClassifier:
             print_info(f"正在读取文件: {tif_path}")
             with rasterio.open(tif_path) as src:
                 self.profile = src.profile
+                # 保存bounds信息（profile中默认不包含bounds）
+                self.profile['bounds'] = src.bounds
                 # 读取所有波段
                 self.data = src.read()
                 print_success(f"成功读取TIF文件")
@@ -271,16 +346,29 @@ class ForestClassifier:
         red_band = self.data[BAND_INDICES['red']]
         nir_band = self.data[BAND_INDICES['nir']]
 
-        # 避免除以零（使用numpy的向量化操作）
+        # 创建有效值掩膜（排除零值）
+        valid_mask = (red_band != 0) & (nir_band != 0)
+        print_info(f"有效像素数: {np.sum(valid_mask)} / {red_band.size} ({np.sum(valid_mask)/red_band.size*100:.2f}%)")
+
+        # 避免除以零和接近零的值（使用更大的阈值0.01）
         denominator = nir_band + red_band
-        denominator = np.where(denominator == 0, 1e-10, denominator)
+        denominator_safe = np.where(np.abs(denominator) < 0.01, 0.01, denominator)
 
-        # 使用numpy的向量化操作计算NDVI（已自动利用多核CPU）
-        self.ndvi = (nir_band - red_band) / denominator
+        # 计算NDVI
+        ndvi_raw = (nir_band - red_band) / denominator_safe
 
+        # 将NDVI裁剪到有效范围[-1, 1]
+        self.ndvi = np.clip(ndvi_raw, -1, 1)
+
+        # 将无效像素标记为NaN
+        self.ndvi[~valid_mask] = np.nan
+
+        # 统计有效NDVI值
+        valid_ndvi = self.ndvi[valid_mask]
         print_success(f"NDVI计算完成")
-        print_info(f"NDVI范围: [{self.ndvi.min():.3f}, {self.ndvi.max():.3f}]")
-        print_info(f"NDVI均值: {self.ndvi.mean():.3f}")
+        print_info(f"NDVI范围（有效值）: [{valid_ndvi.min():.4f}, {valid_ndvi.max():.4f}]")
+        print_info(f"NDVI均值（有效值）: {valid_ndvi.mean():.4f}")
+        print_info(f"NDVI中位数（有效值）: {np.median(valid_ndvi):.4f}")
 
         # 检查内存使用
         if self.check_memory_limit():
@@ -302,6 +390,23 @@ class ForestClassifier:
 
         # 移除无效值（NaN或Inf）
         valid_mask = np.all(np.isfinite(features), axis=1)
+
+        # 移除零值掩膜（所有波段都为零的像素）
+        zero_mask = np.all(features == 0, axis=1)
+        valid_mask = valid_mask & (~zero_mask)
+
+        # 统计无效像素
+        total_pixels = features.shape[0]
+        valid_pixels = np.sum(valid_mask)
+        zero_pixels = np.sum(zero_mask)
+        invalid_pixels = total_pixels - valid_pixels
+
+        print(f"预处理统计:")
+        print(f"  总像素数: {total_pixels}")
+        print(f"  有效像素数: {valid_pixels} ({valid_pixels/total_pixels*100:.2f}%)")
+        print(f"  零值掩膜像素: {zero_pixels} ({zero_pixels/total_pixels*100:.2f}%)")
+        print(f"  其他无效像素(NaN/Inf): {invalid_pixels - zero_pixels} ({(invalid_pixels - zero_pixels)/total_pixels*100:.2f}%)")
+
         features_clean = features[valid_mask]
 
         # 归一化处理
@@ -465,24 +570,6 @@ class ForestClassifier:
         print_info(f"正在提取 {num_superpixels} 个超像素的特征...")
         print_info(f"并行进程数: {self.parallel_config['feature_extraction_n_jobs']}")
 
-        # 定义特征提取函数
-        def extract_single_superpixel_features(sp_id, data, ndvi, n_bands):
-            mask = (segments == sp_id)
-            features = []
-
-            # 计算每个波段的平均值
-            for band_idx in range(n_bands):
-                band_data = data[band_idx][mask]
-                mean_value = np.mean(band_data) if len(band_data) > 0 else 0
-                features.append(mean_value)
-
-            # 添加NDVI特征
-            ndvi_values = ndvi[mask]
-            mean_ndvi = np.mean(ndvi_values) if len(ndvi_values) > 0 else 0
-            features.append(mean_ndvi)
-
-            return sp_id, features
-
         # 使用并行处理提取特征
         n_jobs = self.parallel_config['feature_extraction_n_jobs']
 
@@ -498,7 +585,7 @@ class ForestClassifier:
                         raise KeyboardInterrupt("用户中断了程序执行")
                     future = executor.submit(
                         extract_single_superpixel_features,
-                        sp_id, self.data, self.ndvi, n_bands
+                        sp_id, segments, self.data, self.ndvi, n_bands
                     )
                     futures.append(future)
 
@@ -531,7 +618,12 @@ class ForestClassifier:
 
                 # 添加NDVI特征
                 ndvi_values = self.ndvi[mask]
-                mean_ndvi = np.mean(ndvi_values) if len(ndvi_values) > 0 else 0
+                # 排除NaN值（零值掩膜）
+                valid_ndvi = ndvi_values[~np.isnan(ndvi_values)]
+                if len(valid_ndvi) > 0:
+                    mean_ndvi = np.mean(valid_ndvi)
+                else:
+                    mean_ndvi = 0
                 features.append(mean_ndvi)
 
                 superpixel_features.append(features)
@@ -582,18 +674,6 @@ class ForestClassifier:
             print_info("正在标记小斑块...")
             print_info(f"并行进程数: {self.parallel_config['post_process_n_jobs']}")
 
-            def process_single_class(label, labels, min_patch):
-                """处理单个类别的小斑块"""
-                mask = (labels == label).astype(np.uint8)
-                labeled_array, num_features = ndimage.label(mask)
-
-                small_patches = []
-                for i in range(1, num_features + 1):
-                    if np.sum(labeled_array == i) < min_patch:
-                        small_patches.append(labeled_array == i)
-
-                return label, small_patches
-
             n_jobs = self.parallel_config['post_process_n_jobs']
 
             if n_jobs > 1 and self.n_classes > 2:
@@ -634,7 +714,7 @@ class ForestClassifier:
 
             # 用周围主要类别填充
             print_info("正在填充小斑块...")
-            from scipy.ndimage import mode
+            from scipy.stats import mode
             for i in range(self.n_classes):
                 mask = (filtered_labels == -1)
                 if np.any(mask):
@@ -648,7 +728,7 @@ class ForestClassifier:
                                     neighbors = filtered_labels[y-1:y+2, x-1:x+2]
                                     neighbors = neighbors[neighbors != -1]
                                     if len(neighbors) > 0:
-                                        filled[y, x] = mode(neighbors)[0][0]
+                                        filled[y, x] = mode(neighbors, keepdims=False).mode[0]
                         filtered_labels = filled
 
             self.labels = filtered_labels
@@ -673,10 +753,13 @@ class ForestClassifier:
             mask = (self.labels == i)
             if np.any(mask):
                 class_ndvi = self.ndvi[mask]
-                class_stats[i] = {
-                    'mean_ndvi': np.mean(class_ndvi),
-                    'pixel_count': np.sum(mask)
-                }
+                # 排除NaN值（零值掩膜）
+                valid_ndvi = class_ndvi[~np.isnan(class_ndvi)]
+                if len(valid_ndvi) > 0:
+                    class_stats[i] = {
+                        'mean_ndvi': np.mean(valid_ndvi),
+                        'pixel_count': np.sum(mask)
+                    }
 
         # 根据NDVI阈值识别森林类别
         forest_classes = []
@@ -1517,7 +1600,48 @@ class ForestClassifier:
             if 'transform' in self.profile:
                 pixel_width = abs(self.profile['transform'][0])
                 pixel_height = abs(self.profile['transform'][4])
-                pixel_area_m2 = pixel_width * pixel_height
+
+                # 检测坐标系类型
+                if 'crs' in self.profile and self.profile['crs'] is not None:
+                    crs = self.profile['crs']
+                    is_geographic = crs.is_geographic
+
+                    if is_geographic:
+                        # 地理坐标系（如EPSG:4326），需要将度数转换为米
+                        print_info("检测到地理坐标系（经纬度），正在进行度数到米的转换...")
+
+                        # 获取影像中心纬度
+                        if 'bounds' in self.profile:
+                            lat_center = (self.profile['bounds'].top + self.profile['bounds'].bottom) / 2
+                        else:
+                            # 如果没有bounds信息，使用默认值30度
+                            lat_center = 30.0
+                            print_warning("无法获取影像边界信息，使用默认纬度30度进行转换")
+
+                        # 计算该纬度下1度对应的米数
+                        # 纬度方向：1度纬度 ≈ 111132.954 - 559.822 * cos(2*lat)
+                        # 经度方向：1度经度 ≈ 111412.84 * cos(lat)
+                        lat_rad = np.deg2rad(lat_center)
+                        meters_per_degree_lat = 111132.954 - 559.822 * np.cos(2 * lat_rad)
+                        meters_per_degree_lon = 111412.84 * np.cos(lat_rad)
+
+                        print_info(f"中心纬度: {lat_center:.4f}°")
+                        print_info(f"1度纬度 ≈ {meters_per_degree_lat:.2f} 米")
+                        print_info(f"1度经度 ≈ {meters_per_degree_lon:.2f} 米")
+
+                        # 将度数转换为米
+                        pixel_width_m = pixel_width * meters_per_degree_lon
+                        pixel_height_m = pixel_height * meters_per_degree_lat
+                        pixel_area_m2 = pixel_width_m * pixel_height_m
+
+                        print_info(f"像素实际尺寸: {pixel_width_m:.2f}m × {pixel_height_m:.2f}m")
+                    else:
+                        # 投影坐标系（如UTM），直接使用transform中的米值
+                        print_info("检测到投影坐标系，直接使用米单位")
+                        pixel_area_m2 = pixel_width * pixel_height
+                else:
+                    print_warning("无法获取CRS信息，假设transform中的值为米")
+                    pixel_area_m2 = pixel_width * pixel_height
             else:
                 print_warning("无法从元数据获取像素面积，假设为30m x 30m（Landsat）")
                 pixel_area_m2 = 30 * 30
@@ -1617,6 +1741,10 @@ class ForestClassifier:
         if not OUTPUT_CONFIG['visualization']:
             print_warning("可视化已禁用")
             return
+
+        # 配置中文字体支持
+        plt.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'STHeiti', 'Arial Unicode MS', 'Microsoft YaHei']
+        plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
         print_info(f"正在生成可视化结果...")
         algorithm = self.config.get('algorithm', 'slic')
@@ -1805,11 +1933,11 @@ def parse_args():
     # 波段配置参数
     band_group = parser.add_argument_group('波段配置')
     band_group.add_argument('--red-band', type=int,
-                          default=BAND_INDICES['red'],
-                          help='红光波段索引（从0开始）')
+                          default=BAND_INDICES['red'] + 1,
+                          help='红光波段（第几个波段，从1开始）')
     band_group.add_argument('--nir-band', type=int,
-                          default=BAND_INDICES['nir'],
-                          help='近红外波段索引（从0开始）')
+                          default=BAND_INDICES['nir'] + 1,
+                          help='近红外波段（第几个波段，从1开始）')
 
     # 后处理参数
     post_group = parser.add_argument_group('后处理参数')
@@ -2007,17 +2135,19 @@ def interactive_input():
     print(f"\n{Fore.YELLOW}【波段配置】{Style.RESET_ALL}")
     print(f"  Landsat 8: Red=3, NIR=4")
     print(f"  Sentinel-2: Red=3, NIR=7")
-    args.red_band = input(f"红光波段索引 [{BAND_INDICES['red']}]: ").strip()
+    args.red_band = input(f"红光波段（第几个波段） [{BAND_INDICES['red'] + 1}]: ").strip()
     if not args.red_band:
         args.red_band = BAND_INDICES['red']
     else:
-        args.red_band = int(args.red_band)
+        # 将用户输入的1-based计数转换为0-based索引
+        args.red_band = int(args.red_band) - 1
 
-    args.nir_band = input(f"近红外波段索引 [{BAND_INDICES['nir']}]: ").strip()
+    args.nir_band = input(f"近红外波段（第几个波段） [{BAND_INDICES['nir'] + 1}]: ").strip()
     if not args.nir_band:
         args.nir_band = BAND_INDICES['nir']
     else:
-        args.nir_band = int(args.nir_band)
+        # 将用户输入的1-based计数转换为0-based索引
+        args.nir_band = int(args.nir_band) - 1
 
     # 后处理参数
     print(f"\n{Fore.YELLOW}【后处理参数】{Style.RESET_ALL}")
@@ -2238,7 +2368,7 @@ def main(input_tif, config=None):
             block_stats = classifier.calculate_block_statistics(blocks_gdf)
             if block_stats:
                 # 保存区块统计
-                block_stats_file = os.path.join(output_dir, 'block_statistics.json')
+                block_stats_file = os.path.join(output_dir, '区块统计.json')
                 with open(block_stats_file, 'w', encoding='utf-8') as f:
                     json.dump(block_stats, f, indent=2, ensure_ascii=False)
                 print_success(f"区块统计已保存: {block_stats_file}")
@@ -2278,7 +2408,7 @@ def main(input_tif, config=None):
         # 可视化
         if OUTPUT_CONFIG['visualization']:
             print_info("正在生成可视化结果...")
-            vis_output = os.path.join(output_dir, 'classification_results.png')
+            vis_output = os.path.join(output_dir, '分类结果可视化.png')
             classifier.visualize_results(vis_output, class_info)
 
 
@@ -2335,9 +2465,8 @@ def main(input_tif, config=None):
 if __name__ == '__main__':
     import sys
 
-    # 检测运行模式：只有当第一个参数是以 '-' 开头的选项时才使用命令行模式
-    # 否则（包括只提供文件名或无参数）进入交互式模式
-    if len(sys.argv) > 1 and sys.argv[1].startswith('-'):
+    # 检测运行模式：如果有命令行参数则使用命令行模式，否则进入交互式模式
+    if len(sys.argv) > 1:
         # 命令行模式：解析命令行参数
         args = parse_args()
     else:
@@ -2369,8 +2498,8 @@ if __name__ == '__main__':
             'arbor_forest_min': args.arbor_forest_ndvi,
         },
         'bands': {
-            'red': args.red_band,
-            'nir': args.nir_band,
+            'red': args.red_band - 1,
+            'nir': args.nir_band - 1,
         },
         'post_process': {
             'min_patch_size': args.min_patch_size,
@@ -2434,10 +2563,10 @@ if __name__ == '__main__':
     # 如果有前缀，修改输出文件名
     if args.prefix:
         prefix = args.prefix
-        config['output']['classified_file'] = f"{prefix}_classified.tif"
-        config['output']['ndvi_file'] = f"{prefix}_ndvi.tif"
-        config['output']['statistics_file'] = f"{prefix}_statistics.json"
-        config['output']['report_file'] = f"{prefix}_report.csv"
+        config['output']['classified_file'] = f"{prefix}_分类结果.tif"
+        config['output']['ndvi_file'] = f"{prefix}_植被指数.tif"
+        config['output']['statistics_file'] = f"{prefix}_统计数据.json"
+        config['output']['report_file'] = f"{prefix}_分析报告.csv"
 
     # 调用主函数
     main(args.input, config)
